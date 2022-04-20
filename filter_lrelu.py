@@ -1,7 +1,7 @@
 import os
 import jittor as jt
 import numpy as np
-
+from upfird2d import Upfirdn2d
 jt.flags.use_cuda = 1
 #----------------------------------------------------------------------------
 
@@ -31,6 +31,86 @@ def _parse_padding(padding):
         padding = [px, px, py, py]
     px0, px1, py0, py1 = padding
     return px0, px1, py0, py1
+
+def filter_lrelu_act(x, si, sx, sy, gain, slope, clamp, writeSigns, y_shape, so_shape):
+    cuda_header = code_op_read_file()[0]
+    s_shape3 = 0
+    s_shape2 = 0
+    # print(si)
+    if si.numel() != 0: # si.ndim == 4:
+        s_shape3 = si.shape[-1]
+        s_shape2 = si.shape[2]
+    cuda_src = f'''
+        @alias(x_inp, in0)
+        @alias(s_inp, in1)
+        @alias(s_oup, out0)
+        // Set CUDA device.
+        // Validate arguments.
+        cudaStream_t stream = 0;
+        float gain = {gain};
+        float slope = {slope};
+        float clamp = {clamp};
+        int sx = {sx};
+        int sy = {sy};
+        bool writeSigns = {1 if writeSigns else 0};
+        // Output signs if we don't have sign input.
+        uint8_t* s = s_inp_p;
+        bool readSigns = !!{si.numel()};
+        int s_shape3 = {s_shape3};
+        int s_shape2 = {s_shape2};
+        if (writeSigns)
+        {{
+            int64_t sw = x_inp_shape3;
+            sw = (sw + 15) & ~15; // Round to a multiple of 16 for coalescing.
+            s = s_oup_p;
+            s_shape3 = s_oup_shape3;
+            s_shape2 = s_oup_shape2;
+        }}
+
+
+        filtered_lrelu_act_kernel_params p;
+        p.x         = x_inp_p;
+        p.s         = (readSigns || writeSigns) ? s : 0;
+        p.gain      = gain;
+        p.slope     = slope;
+        p.clamp     = clamp;
+        p.xShape    = make_int4((int)x_inp_shape3, (int)x_inp_shape2, (int)x_inp_shape1, (int)x_inp_shape0);
+        p.xStride   = make_longlong4(x_inp_stride3, x_inp_stride2, x_inp_stride1, x_inp_stride0);
+        p.sShape    = (readSigns || writeSigns) ? make_int2((int)s_shape3 << 2, (int)s_shape2) : make_int2(0, 0); // Width is in elements. Contiguous.
+        p.sOfs      = make_int2(sx, sy);
+
+        // Choose CUDA kernel.
+        void* func = 0;
+        if (writeSigns)
+            func = choose_filtered_lrelu_act_kernel<float, true, false>();
+        else if (readSigns)
+            func = choose_filtered_lrelu_act_kernel<float, false, true>();
+        else
+            func = choose_filtered_lrelu_act_kernel<float, false, false>();
+        assert(func);
+
+        // Launch CUDA kernel.
+        void* args[] = {{&p}};
+        int bx = 128; // 4 warps per block.
+
+        // Logical size of launch = writeSigns ? p.s : p.x
+        uint32_t gx = writeSigns ? p.sShape.x : p.xShape.x;
+        uint32_t gy = writeSigns ? p.sShape.y : p.xShape.y;
+        uint32_t gz = p.xShape.z * p.xShape.w; // Same as in p.sShape if signs are in use.
+        gx = (gx - 1) / bx + 1;
+
+        // Make sure grid y and z dimensions are within CUDA launch limits. Kernel loops internally to do the rest.
+        const uint32_t gmax = 65535;
+        gy = std::min(gy, gmax);
+        gz = std::min(gz, gmax);
+
+        // Launch.
+        CUDA_CHECK(cudaLaunchKernel(func, dim3(gx, gy, gz), bx, args, 0, stream));
+    '''
+
+    so = jt.code(so_shape, jt.uint8, [x, si], cuda_src=cuda_src, cuda_header=cuda_header)
+    jt.sync_all()
+    return x, so
 
 class Filtered_LReLU(jt.Function):
     def __init__(self, up=1, down=1, padding=0, gain=np.sqrt(2), slope=0.2, clamp=None, flip_filter=False, fu=None, fd=None, si=None, sx=0, sy=0):
@@ -66,6 +146,7 @@ class Filtered_LReLU(jt.Function):
         self.y_shape = None
         self.save_so = None
         self.writeSigns = None
+        self.ret = 0
         self.flip_filter = flip_filter
         # TODO: add cache for kernels
 
@@ -121,6 +202,7 @@ class Filtered_LReLU(jt.Function):
             @alias(s_inp, in4)
             @alias(y_oup, out0)
             @alias(s_oup, out1)
+            @alias(ret_oup, out2)
             cudaStream_t stream = 0;
             int up = {self.up};
             int down = {self.down};
@@ -153,6 +235,9 @@ class Filtered_LReLU(jt.Function):
             {{
                 // No kernel found - return empty tensors and indicate missing kernel with return code of -1.
                 LOGir << "No kernel found! Failed!!";
+                int temp[1];
+                temp[0] = 1;
+                cudaMemcpy(ret_oup_p, &temp, 4, cudaMemcpyHostToDevice);
             }} else {{
                 // Input/output element size.
                 // int64_t sz = (x.dtype() == torch::kHalf) ? 2 : 4;
@@ -311,7 +396,18 @@ class Filtered_LReLU(jt.Function):
         sh = yh * self.down - (self.down - 1) + fdt_h
         sw = (sw_active + 15) & ~15
         s_shape = (x.shape[0], x.shape[1], sh, sw // 4)
-        output, sign_output = jt.code([self.y_shape, s_shape],[x.dtype, jt.uint8],[x, self.fu, self.fd, bias, self.si],cuda_header=cuda_header,cuda_src=cuda_src)
+        output, sign_output, ret = jt.code([self.y_shape, s_shape, (1,)],[x.dtype, jt.uint8, jt.int32],[x, self.fu, self.fd, bias, self.si],cuda_header=cuda_header,cuda_src=cuda_src)
+        if ret == 1: # no valid kernel!!!
+            self.ret = 1
+            x = x + bias.unsqueeze(-1).unsqueeze(-1)
+            ups = Upfirdn2d(up=self.up, padding=[self.px0, self.px1, self.py0, self.py1], gain=up**2, flip_filter=self.flip_filter)
+            ups2 = Upfirdn2d(down=self.down, flip_filter=self.flip_filter)
+            with jt.no_grad():
+                y = ups(x, self.fu)
+                print(y)
+                y, sign_output = filter_lrelu_act(y, self.si, self.sx, self.sy, self.gain, self.slope, self.clamp, writeSigns, self.y_shape, s_shape)
+                print(y)
+                output = ups2(y, self.fd)
         self.x_shape = x.shape
         self.x_dtype = x.dtype
         # print(sign_output)
@@ -319,7 +415,6 @@ class Filtered_LReLU(jt.Function):
         return output
 
     def grad(self, grads):  # only support backward for bias and input now (in pytorch.)
-        cuda_header = code_op_read_file()[0]
         # print(grads)
         _, _, xh, xw = self.x_shape
         _, _, yh, yw = self.y_shape
@@ -334,6 +429,18 @@ class Filtered_LReLU(jt.Function):
         sx = self.sx - (self.fu.shape[-1] - 1) + self.px0
         sy = self.sy - (self.fu.shape[0]  - 1) + self.py0
         print(pp, gg, ff, sx, sy)
+        if self.ret == 1:
+            # no valid kernel in forward. Use upfirdn2d instead.
+            # dx = _filtered_lrelu_cuda(up=down, down=up, padding=pp, gain=gg, slope=slope, clamp=None, flip_filter=ff).apply(dy, fd, fu, None, si, sx, sy)
+            ups = Upfirdn2d(up=self.down, padding=[pp[0], pp[1], pp[2], pp[3]], gain=self.down**2, flip_filter=ff)
+            ups2 = Upfirdn2d( down=self.up, flip_filter=ff)
+            with jt.no_grad():
+                y = ups(grads, self.fd)
+                y, sign_output = filter_lrelu_act(y, self.save_so, sx, sy, gg, self.slope, self.clamp, 0, y.shape, (1,1,1,1))
+                dx = ups2(y, self.fu)
+            db = dx.sum([0, 2, 3])
+            return dx, db
+        cuda_header = code_op_read_file()[0]
         if self.fd.ndim == 2:
             fushape_src = '''
             int fushape1 = fu_inp_shape1;
@@ -543,8 +650,8 @@ class Filtered_LReLU(jt.Function):
 
 if __name__ == "__main__":
     nx = np.random.uniform(0,1,(1, 1, 24, 24)).astype("float32")
-    nfu = np.random.uniform(-1,1,(8, 8)).astype("float32")
-    nfd = np.random.uniform(-1,1,(8)).astype("float32")
+    nfu = np.random.uniform(-1,1,(6, 6)).astype("float32")
+    nfd = np.random.uniform(-1,1,(6, 6)).astype("float32")
     nbias = np.random.uniform(-1,1,(1)).astype("float32")
     x = jt.array(nx)
     fu = jt.array(nfu)
@@ -554,6 +661,6 @@ if __name__ == "__main__":
     down = 2
     frelu = Filtered_LReLU(fu=fu, fd=fd, up=up, down=down)
     out = frelu(x, bias)
-    # print(out)
+    print(out)
     grad = jt.grad(out, [x, bias])
-    # print(grad)
+    print(grad)
