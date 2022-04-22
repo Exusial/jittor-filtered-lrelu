@@ -2,6 +2,7 @@ import os
 import jittor as jt
 import numpy as np
 from upfird2d import Upfirdn2d
+
 jt.flags.use_cuda = 1
 #----------------------------------------------------------------------------
 
@@ -107,7 +108,6 @@ def filter_lrelu_act(x, si, sx, sy, gain, slope, clamp, writeSigns, y_shape, so_
         // Launch.
         CUDA_CHECK(cudaLaunchKernel(func, dim3(gx, gy, gz), bx, args, 0, stream));
     '''
-
     so = jt.code(so_shape, jt.uint8, [x, si], cuda_src=cuda_src, cuda_header=cuda_header)
     jt.sync_all()
     return x, so
@@ -136,6 +136,10 @@ class Filtered_LReLU(jt.Function):
             self.fd = jt.ones([1, 1])         
         assert 1 <= self.fu.ndim <= 2
         assert 1 <= self.fd.ndim <= 2
+        if up == 1 and fu.ndim == 1 and fu.shape[0] == 1:
+            fu = (fu ** 2).unsqueeze(0)
+        if down == 1 and fd.ndim == 1 and fd.shape[0] == 1:
+            fd = (fd ** 2).unsqueeze(0)
         self.si = si
         if self.si == None:
             self.si = jt.empty([0, 0, 0, 0]).uint8()
@@ -150,10 +154,10 @@ class Filtered_LReLU(jt.Function):
         self.flip_filter = flip_filter
         # TODO: add cache for kernels
 
-    def execute(self, x, bias=jt.empty([1])): 
+    def execute(self, x, bias = None): 
         assert x.dtype == jt.float32, "Only support float32 for now."
         cuda_header = code_op_read_file()[0]
-        if bias == jt.empty([1]):
+        if bias is None:
             bias = jt.zeros([x.shape[1]])
         self.save_bias = bias
         writeSigns = (self.si.numel() == 0) and (x.requires_grad or bias.requires_grad)
@@ -234,7 +238,7 @@ class Filtered_LReLU(jt.Function):
             if (!test_spec.exec)
             {{
                 // No kernel found - return empty tensors and indicate missing kernel with return code of -1.
-                LOGir << "No kernel found! Failed!!";
+                LOGir << "No kernel found! Back to generic mode!!";
                 int temp[1];
                 temp[0] = 1;
                 cudaMemcpy(ret_oup_p, &temp, 4, cudaMemcpyHostToDevice);
@@ -245,14 +249,14 @@ class Filtered_LReLU(jt.Function):
                 // Input sizes.
                 int64_t xw = (int)x_inp_shape3;
                 int64_t xh = (int)x_inp_shape2;
-                int64_t fut_w = fushape1;
-                int64_t fut_h = (int)fu_inp_shape0  - 1;
-                int64_t fdt_w = fdshape1;
-                int64_t fdt_h = (int)fd_inp_shape0  - 1;
-
+                int64_t fut_w = fushape1 - 1;
+                int64_t fut_h = (int)fu_inp_shape0 - 1;
+                int64_t fdt_w = fdshape1 - 1;
+                int64_t fdt_h = (int)fd_inp_shape0 - 1;
                 // Logical size of upsampled buffer.
                 int64_t cw = xw * up + (px0 + px1) - fut_w;
                 int64_t ch = xh * up + (py0 + py1) - fut_h;
+                // LOGir << "jittor shape" << fut_w << " " << fut_h << " " << fdt_w << " " << fdt_h << " " << cw << " " << ch;
                 // assert(cw > fdt_w && ch > fdt_h, "upsampled buffer must be at least the size of downsampling filter");
                 // assert(cw <= INT_MAX && ch <= INT_MAX, "upsampled buffer is too large");
 
@@ -283,7 +287,6 @@ class Filtered_LReLU(jt.Function):
                 }}
                 else if (readSigns)
                     sw_active = s_inp_shape3 << 2;
-
                 // Populate rest of CUDA kernel parameters.
                 p.x         = x_inp_p;
                 p.y         = y_oup_p;
@@ -397,6 +400,7 @@ class Filtered_LReLU(jt.Function):
         sw = (sw_active + 15) & ~15
         s_shape = (x.shape[0], x.shape[1], sh, sw // 4)
         output, sign_output, ret = jt.code([self.y_shape, s_shape, (1,)],[x.dtype, jt.uint8, jt.int32],[x, self.fu, self.fd, bias, self.si],cuda_header=cuda_header,cuda_src=cuda_src)
+        ret.sync()
         if ret == 1: # no valid kernel!!!
             self.ret = 1
             x = x + bias.unsqueeze(-1).unsqueeze(-1)
@@ -404,10 +408,12 @@ class Filtered_LReLU(jt.Function):
             ups2 = Upfirdn2d(down=self.down, flip_filter=self.flip_filter)
             with jt.no_grad():
                 y = ups(x, self.fu)
-                print(y)
+                # print(y)
                 y, sign_output = filter_lrelu_act(y, self.si, self.sx, self.sy, self.gain, self.slope, self.clamp, writeSigns, self.y_shape, s_shape)
-                print(y)
+                # print(y)
                 output = ups2(y, self.fd)
+        else:
+            self.ret = 0
         self.x_shape = x.shape
         self.x_dtype = x.dtype
         # print(sign_output)
@@ -428,12 +434,12 @@ class Filtered_LReLU(jt.Function):
         ff = 1 if not self.flip_filter else 0
         sx = self.sx - (self.fu.shape[-1] - 1) + self.px0
         sy = self.sy - (self.fu.shape[0]  - 1) + self.py0
-        print(pp, gg, ff, sx, sy)
+        # print("jittor: ", grads.shape)
+        # print("jittor: ", pp, gg, ff, sx, sy)
         if self.ret == 1:
             # no valid kernel in forward. Use upfirdn2d instead.
-            # dx = _filtered_lrelu_cuda(up=down, down=up, padding=pp, gain=gg, slope=slope, clamp=None, flip_filter=ff).apply(dy, fd, fu, None, si, sx, sy)
             ups = Upfirdn2d(up=self.down, padding=[pp[0], pp[1], pp[2], pp[3]], gain=self.down**2, flip_filter=ff)
-            ups2 = Upfirdn2d( down=self.up, flip_filter=ff)
+            ups2 = Upfirdn2d(down=self.up, flip_filter=ff)
             with jt.no_grad():
                 y = ups(grads, self.fd)
                 y, sign_output = filter_lrelu_act(y, self.save_so, sx, sy, gg, self.slope, self.clamp, 0, y.shape, (1,1,1,1))
@@ -485,8 +491,8 @@ class Filtered_LReLU(jt.Function):
             @alias(s_inp, in4)
             @alias(y_oup, out0)
             cudaStream_t stream = 0;
-            int up = {self.up};
-            int down = {self.down};
+            int up = {self.down};
+            int down = {self.up};
             int px0,py0,px1,py1;
             px0 = {pp[0]};
             px1 = {pp[1]};
@@ -515,7 +521,7 @@ class Filtered_LReLU(jt.Function):
             if (!test_spec.exec)
             {{
                 // No kernel found - return empty tensors and indicate missing kernel with return code of -1.
-                LOGir << "No kernel found! Failed!!";
+                LOGir << "Backward No kernel found! Back to generic mode!!";
             }} else {{
                 // Input/output element size.
                 // int64_t sz = (x.dtype() == torch::kHalf) ? 2 : 4;
@@ -523,9 +529,9 @@ class Filtered_LReLU(jt.Function):
                 // Input sizes.
                 int64_t xw = (int)x_inp_shape3;
                 int64_t xh = (int)x_inp_shape2;
-                int64_t fut_w = fushape1;
+                int64_t fut_w = fushape1 - 1;
                 int64_t fut_h = (int)fu_inp_shape0  - 1;
-                int64_t fdt_w = fdshape1;
+                int64_t fdt_w = fdshape1 - 1;
                 int64_t fdt_h = (int)fd_inp_shape0  - 1;
 
                 // Logical size of upsampled buffer.
@@ -539,7 +545,7 @@ class Filtered_LReLU(jt.Function):
                 int64_t yh = y_oup_shape2;
                 // assert(yw > 0 && yh > 0, "output must be at least 1x1");
                 // assert(yw <= INT_MAX && yh <= INT_MAX, "output is too large");
-
+                // LOGir << "jittor bk shape" << fut_w << " " << fut_h << " " << fdt_w << " " << fdt_h << " " << cw << " " << ch;
                 // Allocate sign tensor.
                 bool readSigns = !!{self.save_so.numel()};
                 int64_t sw_active = 0; // Active width of sign tensor.
@@ -549,6 +555,7 @@ class Filtered_LReLU(jt.Function):
                     s_shape3 = s_inp_shape3;
                     s_shape2 = s_inp_shape2;
                 }}
+                // LOGir << "jtgrad " << s_shape3 << " " << s_shape2;
                 sw_active = s_inp_shape3 << 2;
                 // Populate rest of CUDA kernel parameters.
                 p.x         = x_inp_p;
@@ -648,19 +655,44 @@ class Filtered_LReLU(jt.Function):
         db = dx.sum([0, 2, 3])
         return dx, db
 
+
 if __name__ == "__main__":
-    nx = np.random.uniform(0,1,(1, 1, 24, 24)).astype("float32")
-    nfu = np.random.uniform(-1,1,(6, 6)).astype("float32")
-    nfd = np.random.uniform(-1,1,(6, 6)).astype("float32")
-    nbias = np.random.uniform(-1,1,(1)).astype("float32")
+    # x = jt.array(np.random.uniform(0,1,(1,1,3,3)))
+    nx = np.random.uniform(0,0.1,(1,3,1024,1024,)).astype("float32")
+    nfu = np.random.uniform(-0.1,0.1,(12,)).astype("float32")
+    nfd = np.random.uniform(-0.1,0.1,(12,)).astype("float32")
+    nbias = np.random.uniform(-0.1,0.1,(3,)).astype("float32")
+    # # nbias = np.zeros((512,)).astype("float32")
     x = jt.array(nx)
     fu = jt.array(nfu)
     fd = jt.array(nfd)
+    # fu = None
+    # fd = None
     bias = jt.array(nbias)
     up = 2
     down = 2
-    frelu = Filtered_LReLU(fu=fu, fd=fd, up=up, down=down)
+    pad = [-6, -9, -6, -9]
+    frelu = Filtered_LReLU(fu=fu, fd=fd, up=up, down=down, padding=pad)
     out = frelu(x, bias)
-    print(out)
+    # # print(out)
     grad = jt.grad(out, [x, bias])
-    print(grad)
+    print(out, grad)
+    jt.sync_all()
+    # # print(grad)
+    # x = Variable((torch.from_numpy(nx)), requires_grad=True).cuda()
+    # # fu = torch.from_numpy(nfu).cuda()
+    # # fd = torch.from_numpy(nfd).cuda()
+    # fu = None
+    # fd = None
+    # bias = Variable(torch.from_numpy(nbias), requires_grad=True).cuda()
+    # output = filtered_lrelu.filtered_lrelu(x, fu=fu, fd=fd, b=bias, up=up, down=down, padding=pad, gain=np.sqrt(2), slope=0.2, clamp=None, flip_filter=False, impl='cuda')
+    # # print(output)
+    # tgq = torch.autograd.grad(output, x, torch.ones_like(output), retain_graph=True)
+    # tgr = torch.autograd.grad(output, bias, torch.ones_like(output))
+    # # print(tgq)
+    # np.testing.assert_allclose(out.numpy(), output.detach().cpu().numpy())
+    # print("pass forward")
+    # np.testing.assert_allclose(grad[0].numpy(),tgq[0].detach().cpu().numpy(), rtol=1e-3, atol=2e-3)
+    # print("pass input backward")
+    # np.testing.assert_allclose(grad[1].numpy(),tgr[0].detach().cpu().numpy(), rtol=1e-3, atol=2e-3)
+    # print("pass bias backward")
